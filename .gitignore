@@ -1,0 +1,14 @@
+tterm
+*.tr
+*.png
+*.mp4
+*.gif
+/demo*
+/live*
+/frames/
+*.o
+*.a
+*.so
+*.log
+.DS_Store
+__pycache__/
