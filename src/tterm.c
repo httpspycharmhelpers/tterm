@@ -81,6 +81,8 @@ typedef struct {
     uint32_t cur_fg, cur_bg;
     uint8_t cur_attrs;
     int dirty;
+    int cursor_visible;
+    int cursor_blink;
 } VT;
 
 static uint64_t now_us(void) {
@@ -120,6 +122,8 @@ static void vt_init(VT *v, int cols, int rows) {
     v->bot = rows - 1;
     v->st = ST_GROUND;
     for (int i = 0; i < 64; i++) v->params[i] = -1;
+    v->cursor_visible = 1;
+    v->cursor_blink = 1;
     v->dirty = 1;
 }
 
@@ -431,6 +435,7 @@ static void csi_dispatch(VT *v, uint8_t fin) {
             for (int i = 0; i < v->nparams; i++) {
                 int p = v->params[i] < 0 ? 0 : v->params[i];
                 if (p == 6) v->origin = (fin == 'h');
+                else if (p == 25) v->cursor_visible = (fin == 'h');
                 else if (p == 47 || p == 1047 || p == 1049) switch_alt(v, fin == 'h', p == 1049);
             }
         }
@@ -815,6 +820,22 @@ static void render_vt(Renderer *r, VT *v, unsigned char *img) {
             if (wide) x++;
         }
     }
+    if (v->cursor_visible && v->cx >= 0 && v->cx < v->cols && v->cy >= 0 && v->cy < v->rows) {
+        int cx = v->cx * CELL_W, cy = v->cy * CELL_H;
+        int W = v->cols * CELL_W;
+        int H = v->rows * CELL_H;
+        Cell *cur = cell_at(v, v->cx, v->cy);
+        uint32_t ccol = (cur->attrs & A_INVERSE) ? cur->bg : cur->fg;
+        if (!ccol) ccol = DEFAULT_FG;
+        unsigned char cr = (ccol >> 16) & 255, cg = (ccol >> 8) & 255, cb = ccol & 255;
+        for (int xx = 0; xx < 2 && cx + xx < W; xx++) {
+            for (int yy = 0; yy < CELL_H; yy++) {
+                if (cy + yy >= H) break;
+                unsigned char *p = &img[((size_t)(cy + yy) * W + cx + xx) * 3];
+                p[0] = cr; p[1] = cg; p[2] = cb;
+            }
+        }
+    }
 }
 
 static int write_png(const char *path, unsigned char *img, int W, int H) {
@@ -946,12 +967,14 @@ static void term_raw_begin(int raw_in, int raw_out) {
 
 static int cmd_rec(int argc, char **argv) {
     const char *out = "session.tr";
+    const char *aud = NULL;
     int opt_cols = 0, opt_rows = 0;
     for (int i = 2; i < argc; i++) {
         if (!strcmp(argv[i], "-o") && i + 1 < argc) out = argv[++i];
+        else if (!strcmp(argv[i], "-a") && i + 1 < argc) aud = argv[++i];
         else if (!strcmp(argv[i], "-s") && i + 1 < argc) sscanf(argv[++i], "%dx%d", &opt_cols, &opt_rows);
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            fprintf(stderr, "usage: tterm rec [-o FILE] [-s COLSxROWS]\n");
+            fprintf(stderr, "usage: tterm rec [-o FILE] [-s COLSxROWS] [-a AUDIO]\n");
             return 0;
         } else {
             fprintf(stderr, "tterm rec: unknown argument %s\n", argv[i]);
@@ -987,6 +1010,15 @@ static int cmd_rec(int argc, char **argv) {
         execl("/data/data/com.termux/files/usr/bin/bash", "bash", "-i", NULL);
         execl("/system/bin/sh", "sh", "-i", NULL);
         _exit(1);
+    }
+
+    pid_t arec = -1;
+    if (aud) {
+        char cmd[512];
+        snprintf(cmd, sizeof(cmd), "termux-microphone-record -f '%s' -e aac -b 128 -r 44100 >/dev/null 2>&1 & echo $!", aud);
+        FILE *fp = popen(cmd, "r");
+        if (fp) { fscanf(fp, "%d", &arec); pclose(fp); }
+        usleep(200000);
     }
 
     term_raw_begin(1, 1);
@@ -1048,6 +1080,10 @@ static int cmd_rec(int argc, char **argv) {
     term_cleanup();
     int st = 0;
     waitpid(pid, &st, 0);
+    if (arec > 0) {
+        system("termux-microphone-record -q >/dev/null 2>&1");
+        usleep(500000);
+    }
     fprintf(stderr, "[tterm] recorded %.1fs, %llu bytes -> %s\n",
             dur / 1e6, (unsigned long long)total, out);
     return 0;
@@ -1080,9 +1116,13 @@ static int cmd_play(int argc, char **argv) {
     Chunk c;
     int r;
     while ((r = rec_read_chunk(&rf, &c)) == 1) {
-        uint64_t target = (uint64_t)((double)c.ts / speed);
+        uint64_t target = (uint64_t)((double)c.ts / (speed > 0 ? speed : 1.0));
         uint64_t cur = now_us() - t0;
-        if (target > cur) usleep(target - cur);
+        if (target > cur) {
+            uint64_t d = target - cur;
+            if (d > 100000) d = 100000;
+            usleep(d);
+        }
         if (c.type == CHUNK_DATA) fwrite(rf.payload, 1, c.len, stdout);
         else if (c.type == CHUNK_RESIZE && c.len >= sizeof(struct winsize)) {
             struct winsize nws;
@@ -1371,7 +1411,7 @@ static int cmd_video_live(const char *out, int fps, const char *font) {
 }
 
 static int cmd_video(int argc, char **argv) {
-    const char *in = NULL, *out = "video.mp4", *font = NULL;
+    const char *in = NULL, *out = "video.mp4", *font = NULL, *aud = NULL;
     int fps = 10, live = 0;
     double speed = 1.0;
     for (int i = 2; i < argc; i++) {
@@ -1379,17 +1419,28 @@ static int cmd_video(int argc, char **argv) {
         else if (!strcmp(argv[i], "-f") && i + 1 < argc) fps = atoi(argv[++i]);
         else if (!strcmp(argv[i], "-x") && i + 1 < argc) speed = atof(argv[++i]);
         else if (!strcmp(argv[i], "-F") && i + 1 < argc) font = argv[++i];
+        else if (!strcmp(argv[i], "-a") && i + 1 < argc) aud = argv[++i];
         else if (!strcmp(argv[i], "-l")) live = 1;
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) {
-            fprintf(stderr, "usage: tterm video FILE [-o out.mp4] [-f fps] [-x SPEED] [-F FONT.ttf]\n"
-                            "       tterm video -l [-o out.mp4] [-f fps] [-F FONT.ttf]   live recording, Ctrl-G stops\n");
+            fprintf(stderr, "usage: tterm video FILE [-o out.mp4] [-f fps] [-x SPEED] [-F FONT.ttf] [-a AUDIO]\n"
+                            "       tterm video -l [-o out.mp4] [-f fps] [-F FONT.ttf] [-a AUDIO]   live recording, Ctrl-G stops\n");
             return 0;
-        } else in = argv[i];
+        } else if (!in && argv[i][0] != '-') in = argv[i];
     }
     if (fps < 1 || fps > 120) fps = 10;
     if (speed < 0.1) speed = 0.1;
     if (speed > 100.0) speed = 100.0;
-    if (live) return cmd_video_live(out, fps, font);
+    if (live) {
+        int r = cmd_video_live(out, fps, font);
+        if (r == 0 && aud && access(aud, R_OK) == 0) {
+            char tmp[512];
+            snprintf(tmp, sizeof(tmp), "%s.mix.mp4", out);
+            char cmd2[1024];
+            snprintf(cmd2, sizeof(cmd2), "ffmpeg -y -loglevel error -i '%s' -i '%s' -c:v copy -c:a aac -shortest '%s' && mv -f '%s' '%s'", out, aud, tmp, tmp, out);
+            system(cmd2);
+        }
+        return r;
+    }
     if (!in) { fprintf(stderr, "tterm video: missing recording file or -l\n"); return 1; }
 
     RecFile rf;
@@ -1434,13 +1485,14 @@ static int cmd_video(int argc, char **argv) {
     Renderer rr;
     renderer_init(&rr, font);
 
-    uint64_t nframes = (uint64_t)((double)dur / speed * fps / 1e6) + 1;
+    if (speed <= 0.0) speed = 1.0;
+    uint64_t nframes = (uint64_t)((double)dur / 1000000.0 * (double)fps / speed) + 3;
     unsigned char *frame = calloc((size_t)W * H, 3);
     unsigned char *vtimg = calloc((size_t)cols * rows * CELL_W * CELL_H, 3);
     int frame_valid = 0;
     int ok = 1;
     for (uint64_t i = 0; i < nframes; i++) {
-        uint64_t t = (uint64_t)((double)i / fps * 1e6 * speed);
+        uint64_t t = (uint64_t)(( (double)i * 1000000.0 ) / ((double)fps * speed));
         int done = rec_replay_into(&rf, &vt, t);
         int resized = 0;
         if (vt.cols != cols || vt.rows != rows) {
@@ -1478,9 +1530,17 @@ static int cmd_video(int argc, char **argv) {
         fprintf(stderr, "tterm: ffmpeg exited with %d\n", fr);
         ok = 0;
     }
-    if (ok)
+    if (ok) {
         fprintf(stderr, "[tterm] video %dx%d @%dfps, %.1fx, %.1fs -> %s\n",
-                W, H, fps, speed, dur / 1e6 / speed, out);
+                W, H, fps, speed, dur / 1000000.0 / speed, out);
+        if (aud && access(aud, R_OK) == 0) {
+            char tmp[512];
+            snprintf(tmp, sizeof(tmp), "%s.mix.mp4", out);
+            char cmd2[1024];
+            snprintf(cmd2, sizeof(cmd2), "ffmpeg -y -loglevel error -i '%s' -i '%s' -c:v copy -c:a aac -shortest '%s' && mv -f '%s' '%s'", out, aud, tmp, tmp, out);
+            system(cmd2);
+        }
+    }
     free(frame);
     free(vtimg);
     vt_free(&vt);
@@ -1494,12 +1554,12 @@ static void usage(void) {
         "usage: tterm COMMAND [OPTIONS]\n"
         "\n"
         "commands:\n"
-        "  rec   [-o FILE] [-s COLSxROWS]                          record a session\n"
+        "  rec   [-o FILE] [-s COLSxROWS] [-a AUDIO]               record a session\n"
         "  play  FILE [-x SPEED]                                  replay a recording\n"
         "  shot  FILE [-o out.png] [-t SEC] [-F FONT.ttf] [-v]    render a frame to PNG\n"
-        "  video FILE [-o out.mp4] [-f FPS] [-x SPEED] [-F FONT.ttf]\n"
+        "  video FILE [-o out.mp4] [-f FPS] [-x SPEED] [-F FONT.ttf] [-a AUDIO]\n"
         "                                                         render a recording to MP4\n"
-        "  video -l [-o out.mp4] [-f FPS] [-F FONT.ttf]           live capture, Ctrl-G stops\n"
+        "  video -l [-o out.mp4] [-f FPS] [-F FONT.ttf] [-a AUDIO] live capture, Ctrl-G stops\n"
         "\n"
         "environment:\n"
         "  TTERM_FONT   font file (default: ~/.termux/font.ttf, then DejaVuSansMono)\n");
